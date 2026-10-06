@@ -430,6 +430,57 @@ static void upng_free_source(upng_t *upng) {
   upng->source.owning = 0;
 }
 
+/* FCTL - Frame Control CHUNK
+ byte
+ 0    sequence_number (uint32_t) Sequence number of the animation chunk, starting from 0
+ 4    width           (uint32_t) Width of the following frame
+ 8    height          (uint32_t) Height of the following frame
+ 12    x_offset       (uint32_t) X position at which to render the following frame
+ 16    y_offset       (uint32_t) Y position at which to render the following frame
+ 20    delay_num      (uint16_t) Frame delay fraction numerator
+ 22    delay_den      (uint16_t) Frame delay fraction denominator
+ 24    dispose_op     (uint8_t)  Frame area disposal to be done after rendering this frame
+ 25    blend_op       (uint8_t)  Type of frame area rendering for this frame
+ */
+static upng_error parse_fctl(upng_t *upng, const uint8_t *data, uint32_t data_length) {
+  if (data_length < FCTL_CHUNK_SIZE - CHUNK_META_SIZE) {
+    SET_ERROR(upng, UPNG_EMALFORMED);
+    return upng->error;
+  }
+
+  uint32_t width = MAKE_WORD_PTR(data + 4);
+  uint32_t height = MAKE_WORD_PTR(data + 8);
+  uint32_t x_offset = MAKE_WORD_PTR(data + 12);
+  uint32_t y_offset = MAKE_WORD_PTR(data + 16);
+
+  /* the frame must lie within the image */
+  if (width == 0 || height == 0 || x_offset > upng->width || width > upng->width - x_offset ||
+      y_offset > upng->height || height > upng->height - y_offset) {
+    SET_ERROR(upng, UPNG_EMALFORMED);
+    return upng->error;
+  }
+
+  if (upng->apng_frame_control == NULL) {
+    upng->apng_frame_control = UPNG_MALLOC(sizeof(apng_fctl));
+    if (upng->apng_frame_control == NULL) {
+      SET_ERROR(upng, UPNG_ENOMEM);
+      return upng->error;
+    }
+  }
+
+  upng->apng_frame_control->sequence_number = MAKE_WORD_PTR(data);
+  upng->apng_frame_control->width = width;
+  upng->apng_frame_control->height = height;
+  upng->apng_frame_control->x_offset = x_offset;
+  upng->apng_frame_control->y_offset = y_offset;
+  upng->apng_frame_control->delay_num = MAKE_SHORT_PTR(data + 20);
+  upng->apng_frame_control->delay_den = MAKE_SHORT_PTR(data + 22);
+  upng->apng_frame_control->dispose_op = *(data + 24);
+  upng->apng_frame_control->blend_op = *(data + 25);
+
+  return upng->error;
+}
+
 /*read the information from the header and store it in the upng_Info. return value is error*/
 upng_error upng_header(upng_t *upng) {
   /* if we have an error state, bail now */
@@ -465,6 +516,13 @@ upng_error upng_header(upng_t *upng) {
   upng->height = MAKE_WORD_PTR(upng->source.buffer + 20);
   upng->color_depth = upng->source.buffer[24];
   upng->color_type = (upng_color)upng->source.buffer[25];
+
+  /* the spec limits dimensions to 2^31 - 1 */
+  if (upng->width == 0 || upng->height == 0 || upng->width > INT32_MAX ||
+      upng->height > INT32_MAX) {
+    SET_ERROR(upng, UPNG_EMALFORMED);
+    return upng->error;
+  }
 
   /* determine our color format */
   upng->format = determine_format(upng);
@@ -516,13 +574,18 @@ upng_error upng_decode_metadata(upng_t *upng) {
   /* scan through the chunks, finding the size of all IDAT chunks, and also
    * verify general well-formed-ness */
   while (upng->cursor < upng->source.buffer + upng->source.size) {
+    uint32_t remaining = (uint32_t)(upng->source.buffer + upng->source.size - upng->cursor);
+    if (remaining < CHUNK_META_SIZE) {
+      SET_ERROR(upng, UPNG_EMALFORMED);
+      return upng->error;
+    }
+
     uint32_t chunk_type = upng_chunk_type(upng->cursor);
     uint32_t data_length = upng_chunk_data_length(upng->cursor);
     const uint8_t *data = upng_chunk_data(upng->cursor);
 
-    /* make sure chunk header+paylaod is not larger than the total compressed */
-    if ((uint32_t)(upng->cursor - upng->source.buffer + data_length + CHUNK_META_SIZE) >
-        upng->source.size) {
+    /* make sure chunk header+payload is not larger than the total compressed */
+    if (data_length > remaining - CHUNK_META_SIZE) {
       SET_ERROR(upng, UPNG_EMALFORMED);
       return upng->error;
     }
@@ -530,8 +593,14 @@ upng_error upng_decode_metadata(upng_t *upng) {
     /* parse chunks */
     switch (chunk_type) {
       case CHUNK_PLTE:
+        /* 3 bytes per color entry, at most one per index for paletted images */
+        if (data_length == 0 || data_length % 3 != 0 || data_length / 3 > 256 ||
+            (upng->color_type == UPNG_PLT && data_length / 3 > (1u << upng->color_depth))) {
+          SET_ERROR(upng, UPNG_EMALFORMED);
+          return upng->error;
+        }
         UPNG_FREE(upng->palette);
-        upng->palette_entries = data_length / 3; // 3 bytes per color entry
+        upng->palette_entries = data_length / 3;
         upng->palette = UPNG_MALLOC(data_length);
         if (upng->palette == NULL) {
           SET_ERROR(upng, UPNG_ENOMEM);
@@ -553,38 +622,15 @@ upng_error upng_decode_metadata(upng_t *upng) {
         }
         break;
       case CHUNK_FCTL:
-        if (upng->apng_frame_control == NULL) {
-          upng->apng_frame_control = UPNG_MALLOC(sizeof(apng_fctl));
-          if (upng->apng_frame_control == NULL) {
-            SET_ERROR(upng, UPNG_ENOMEM);
-            return upng->error;
-          }
+        if (parse_fctl(upng, data, data_length) != UPNG_EOK) {
+          return upng->error;
         }
-
-        /* FCTL - Frame Control CHUNK
-         byte
-         0    sequence_number (uint32_t) Sequence number of the animation chunk, starting from 0
-         4    width           (uint32_t) Width of the following frame
-         8    height          (uint32_t) Height of the following frame
-         12    x_offset       (uint32_t) X position at which to render the following frame
-         16    y_offset       (uint32_t) Y position at which to render the following frame
-         20    delay_num      (uint16_t) Frame delay fraction numerator
-         22    delay_den      (uint16_t) Frame delay fraction denominator
-         24    dispose_op     (uint8_t)  Frame area disposal to be done after rendering this frame
-         25    blend_op       (uint8_t)  Type of frame area rendering for this frame
-         */
-
-        upng->apng_frame_control->sequence_number = MAKE_WORD_PTR(data);
-        upng->apng_frame_control->width = MAKE_WORD_PTR(data + 4);
-        upng->apng_frame_control->height = MAKE_WORD_PTR(data + 8);
-        upng->apng_frame_control->x_offset = MAKE_WORD_PTR(data + 12);
-        upng->apng_frame_control->y_offset = MAKE_WORD_PTR(data + 16);
-        upng->apng_frame_control->delay_num = MAKE_SHORT_PTR(data + 20);
-        upng->apng_frame_control->delay_den = MAKE_SHORT_PTR(data + 22);
-        upng->apng_frame_control->dispose_op = *(data + 24);
-        upng->apng_frame_control->blend_op = *(data + 25);
         break;
       case CHUNK_ACTL:
+        if (data_length < 8) {
+          SET_ERROR(upng, UPNG_EMALFORMED);
+          return upng->error;
+        }
         upng->is_apng = true;
         upng->apng_num_frames = MAKE_WORD_PTR(data);
         upng->apng_num_plays = MAKE_WORD_PTR(data + 4);
@@ -645,13 +691,18 @@ upng_error upng_decode_image(upng_t *upng) {
   /* scan through the chunks, finding the size of all IDAT chunks, and also
    * verify general well-formed-ness */
   while ((upng->cursor < upng->source.buffer + upng->source.size) && !cursor_at_next_frame) {
+    uint32_t remaining = (uint32_t)(upng->source.buffer + upng->source.size - upng->cursor);
+    if (remaining < CHUNK_META_SIZE) {
+      SET_ERROR(upng, UPNG_EMALFORMED);
+      return upng->error;
+    }
+
     uint32_t chunk_type = upng_chunk_type(upng->cursor);
     uint32_t data_length = upng_chunk_data_length(upng->cursor);
     const uint8_t *data = upng_chunk_data(upng->cursor);
 
     /* make sure chunk header+payload is not larger than the total compressed */
-    if ((uint32_t)(upng->cursor - upng->source.buffer + data_length + CHUNK_META_SIZE) >
-        upng->source.size) {
+    if (data_length > remaining - CHUNK_META_SIZE) {
       SET_ERROR(upng, UPNG_EMALFORMED);
       return upng->error;
     }
@@ -659,39 +710,16 @@ upng_error upng_decode_image(upng_t *upng) {
     /* parse chunks */
     switch (chunk_type) {
       case CHUNK_FCTL:
-        if (upng->apng_frame_control == NULL) {
-          upng->apng_frame_control = UPNG_MALLOC(data_length);
-          if (upng->apng_frame_control == NULL) {
-            SET_ERROR(upng, UPNG_ENOMEM);
-            return upng->error;
-          }
+        if (parse_fctl(upng, data, data_length) != UPNG_EOK) {
+          return upng->error;
         }
-
-        /* FCTL - Frame Control CHUNK
-         byte
-         0    sequence_number (uint32_t) Sequence number of the animation chunk, starting from 0
-         4    width           (uint32_t) Width of the following frame
-         8    height          (uint32_t) Height of the following frame
-         12    x_offset       (uint32_t) X position at which to render the following frame
-         16    y_offset       (uint32_t) Y position at which to render the following frame
-         20    delay_num      (uint16_t) Frame delay fraction numerator
-         22    delay_den      (uint16_t) Frame delay fraction denominator
-         24    dispose_op     (uint8_t)  Frame area disposal to be done after rendering this frame
-         25    blend_op       (uint8_t)  Type of frame area rendering for this frame
-         */
-
-        upng->apng_frame_control->sequence_number = MAKE_WORD_PTR(data);
-        upng->apng_frame_control->width = MAKE_WORD_PTR(data + 4);
-        upng->apng_frame_control->height = MAKE_WORD_PTR(data + 8);
-        upng->apng_frame_control->x_offset = MAKE_WORD_PTR(data + 12);
-        upng->apng_frame_control->y_offset = MAKE_WORD_PTR(data + 16);
-        upng->apng_frame_control->delay_num = MAKE_SHORT_PTR(data + 20);
-        upng->apng_frame_control->delay_den = MAKE_SHORT_PTR(data + 22);
-        upng->apng_frame_control->dispose_op = *(data + 24);
-        upng->apng_frame_control->blend_op = *(data + 25);
         break;
       case CHUNK_FDAT:
         /* first 4 bytes in fdAT is sequence number, so skip 4 bytes */
+        if (data_length < 4) {
+          SET_ERROR(upng, UPNG_EMALFORMED);
+          return upng->error;
+        }
         // TODO : fix for multiple consecutive fdAT chunks (PBL-14294)
         compressed = (uint8_t *)(data + 4);
         compressed_size = (data_length - 4);
@@ -726,8 +754,16 @@ upng_error upng_decode_image(upng_t *upng) {
     height = upng->apng_frame_control->height;
   }
 
+  /* no image data before IEND, or the size of the inflated (but still filtered) data overflows */
+  uint64_t width_bits = (uint64_t)width * upng_get_bpp(upng);
+  uint32_t width_aligned_bytes = (uint32_t)((width_bits + 7) / 8);
+  if (compressed == NULL || width_bits > UINT32_MAX ||
+      width_aligned_bytes + 1 > UINT32_MAX / height) {
+    SET_ERROR(upng, UPNG_EMALFORMED);
+    return upng->error;
+  }
+
   /* allocate space to store inflated (but still filtered) data */
-  int32_t width_aligned_bytes = (width * upng_get_bpp(upng) + 7) / 8;
   inflated_size = (width_aligned_bytes * height) + height; // pad byte
   inflated = (uint8_t *)UPNG_MALLOC(inflated_size);
   if (inflated == NULL) {
