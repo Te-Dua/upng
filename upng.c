@@ -33,44 +33,33 @@
    1.2  10 Mar 2014  Support non-byte-aligned images (fixes 1,2,4 bit PNG8 support)
    1.3  11 Feb 2015  Add PNG8 alpha_palette support.  Add APNG support (iterative frame decoding)
    1.4  14 Dec 2015  Replace built-in huffman inflate with tinflate (tiny inflate)
+   1.5   6 Oct 2026  Inflate through uzlib, configurable allocator (Core Devices)
  */
 
 #include "upng.h"
 
-#include "kernel/pbl_malloc.h"
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
 
-#include "tinflate.h"
+#include "uzlib.h"
+
+#ifdef UPNG_CONFIG_FILE
+#include UPNG_CONFIG_FILE
+#endif
+
+#ifndef UPNG_MALLOC
+#define UPNG_MALLOC(size) malloc(size)
+#endif
+
+#ifndef UPNG_FREE
+#define UPNG_FREE(ptr) free(ptr)
+#endif
 
 // Used to allow direct character buffer access with offsets and byteswap in place
-#define MAKE_WORD_PTR(p)  PBL_FOURCC((p)[0], (p)[1], (p)[2], (p)[3])
+#define MAKE_WORD_PTR(p)  UPNG_FOURCC((p)[0], (p)[1], (p)[2], (p)[3])
 #define MAKE_SHORT_PTR(p) (uint16_t)(((uint8_t)((p)[0]) << 8) | (uint8_t)((p)[1]))
-
-#define FIRST_LENGTH_CODE_INDEX 257
-#define LAST_LENGTH_CODE_INDEX  285
-
-/*256 literals, the end code, some length codes, and 2 unused codes */
-#define NUM_DEFLATE_CODE_SYMBOLS 288
-/*the distance codes have their own symbols, 30 used, 2 unused */
-#define NUM_DISTANCE_SYMBOLS 32
-/* the code length codes. 0-15: code lengths, 16: copy previous 3-6 times,
- * 17: 3-10 zeros, 18: 11-138 zeros */
-#define NUM_CODE_LENGTH_CODES 19
-/* largest number of symbols used by any tree type */
-#define MAX_SYMBOLS 288
-
-#define DEFLATE_CODE_BITLEN 15
-#define DISTANCE_BITLEN     15
-#define CODE_LENGTH_BITLEN  7
-#define MAX_BIT_LENGTH      15 // bug? 15 /* largest bitlen used by any tree type */
-
-#define DEFLATE_CODE_BUFFER_SIZE (NUM_DEFLATE_CODE_SYMBOLS * 2)
-#define DISTANCE_BUFFER_SIZE     (NUM_DISTANCE_SYMBOLS * 2)
-#define CODE_LENGTH_BUFFER_SIZE  (NUM_DISTANCE_SYMBOLS * 2)
 
 #define SET_ERROR(upng, code)      \
   do {                             \
@@ -138,106 +127,6 @@ struct upng_t {
   upng_source source;
 };
 
-static uint8_t read_bit(uint32_t *bitpointer, const uint8_t *bitstream) {
-  uint8_t result = (uint8_t)((bitstream[(*bitpointer) >> 3] >> ((*bitpointer) & 0x7)) & 1);
-  (*bitpointer)++;
-  return result;
-}
-
-static void inflate_uncompressed(upng_t *upng, uint8_t *out, uint32_t outsize, const uint8_t *in,
-                                 uint32_t *bp, uint32_t *pos, uint32_t inlength) {
-  uint32_t p;
-  uint16_t len, nlen, n;
-
-  /* go to first boundary of byte */
-  while (((*bp) & 0x7) != 0) {
-    (*bp)++;
-  }
-  p = (*bp) / 8; /*byte position */
-
-  /* read len (2 bytes) and nlen (2 bytes) */
-  if (p >= inlength - 4) {
-    SET_ERROR(upng, UPNG_EMALFORMED);
-    return;
-  }
-
-  len = in[p] + 256 * in[p + 1];
-  p += 2;
-  nlen = in[p] + 256 * in[p + 1];
-  p += 2;
-
-  /* check if 16-bit nlen is really the one's complement of len */
-  if (len + nlen != UINT16_MAX) {
-    SET_ERROR(upng, UPNG_EMALFORMED);
-    return;
-  }
-
-  if ((*pos) + len > outsize) {
-    SET_ERROR(upng, UPNG_EMALFORMED);
-    return;
-  }
-
-  /* read the literal data: len bytes are now stored in the out buffer */
-  if (p + len > inlength) {
-    SET_ERROR(upng, UPNG_EMALFORMED);
-    return;
-  }
-
-  for (n = 0; n < len; n++) {
-    out[(*pos)++] = in[p++];
-  }
-
-  (*bp) = p * 8;
-}
-
-/*inflate the deflated data (cfr. deflate spec); return value is the error*/
-static upng_error uz_inflate_data(upng_t *upng, uint8_t *out, uint32_t outsize, const uint8_t *in,
-                                  uint32_t insize, uint32_t inpos) {
-  /*bit pointer in the "in" data, current byte is bp >> 3,
-   * current bit is bp & 0x7 (from lsb to msb of the byte) */
-  uint32_t bp = 0;
-  uint32_t pos = 0; /*byte position in the out buffer */
-
-  uint16_t done = 0;
-
-  while (done == 0) {
-    uint16_t btype;
-
-    /* ensure next bit doesn't point past the end of the buffer */
-    if ((bp >> 3) >= insize) {
-      SET_ERROR(upng, UPNG_EMALFORMED);
-      return upng->error;
-    }
-
-    /* read block control bits */
-    done = read_bit(&bp, &in[inpos]);
-    btype = read_bit(&bp, &in[inpos]) | (read_bit(&bp, &in[inpos]) << 1);
-
-    /* process control type appropriateyly */
-    if (btype == 3) {
-      SET_ERROR(upng, UPNG_EMALFORMED);
-      return upng->error;
-    } else if (btype == 0) {
-      inflate_uncompressed(upng, out, outsize, &in[inpos], &bp, &pos, insize); /*no compression */
-    } else {
-      /*compression, btype 01 or 10 */
-      int tinflate_status = tinflate_uncompress(out, (unsigned int *)&outsize, &in[inpos], insize);
-      if (tinflate_status < 0) {
-        SET_ERROR(upng, UPNG_EMALFORMED);
-        return upng->error;
-      }
-      done = 1; // No need to increment bp, tinflate handles end-of-bounds marker
-    }
-
-    /* stop if an error has occured */
-    if (upng->error != UPNG_EOK) {
-      return upng->error;
-    }
-  }
-
-  return upng->error;
-}
-
 static upng_error uz_inflate(upng_t *upng, uint8_t *out, uint32_t outsize, const uint8_t *in,
                              uint32_t insize) {
   /* we require two bytes for the zlib data header */
@@ -267,8 +156,26 @@ static upng_error uz_inflate(upng_t *upng, uint8_t *out, uint32_t outsize, const
     return upng->error;
   }
 
-  /* create output buffer */
-  uz_inflate_data(upng, out, outsize, in, insize, 2);
+  struct uzlib_uncomp *d = UPNG_MALLOC(sizeof(*d));
+  if (d == NULL) {
+    SET_ERROR(upng, UPNG_ENOMEM);
+    return upng->error;
+  }
+
+  uzlib_uncompress_init(d, NULL, 0);
+  d->source = in + 2;
+  d->source_limit = in + insize;
+  d->source_read_cb = NULL;
+  d->dest_start = out;
+  d->dest = out;
+  d->dest_limit = out + outsize;
+
+  int res = uzlib_uncompress(d);
+  if (res < 0 || d->dest != d->dest_limit) {
+    SET_ERROR(upng, UPNG_EMALFORMED);
+  }
+
+  UPNG_FREE(d);
 
   return upng->error;
 }
@@ -515,7 +422,7 @@ static void upng_free_source(upng_t *upng) {
   }
 
   if (upng->source.owning != 0) {
-    task_free((void *)upng->source.buffer);
+    UPNG_FREE((void *)upng->source.buffer);
   }
 
   upng->source.buffer = NULL;
@@ -623,9 +530,9 @@ upng_error upng_decode_metadata(upng_t *upng) {
     /* parse chunks */
     switch (chunk_type) {
       case CHUNK_PLTE:
-        task_free(upng->palette);
+        UPNG_FREE(upng->palette);
         upng->palette_entries = data_length / 3; // 3 bytes per color entry
-        upng->palette = task_malloc(data_length);
+        upng->palette = UPNG_MALLOC(data_length);
         if (upng->palette == NULL) {
           SET_ERROR(upng, UPNG_ENOMEM);
           return upng->error;
@@ -633,11 +540,11 @@ upng_error upng_decode_metadata(upng_t *upng) {
         memcpy(upng->palette, data, data_length);
         break;
       case CHUNK_TRNS:
-        task_free(upng->alpha_palette);
+        UPNG_FREE(upng->alpha_palette);
         upng->alpha_palette_entries = data_length; // 1 byte per color entry
         // protect against tools that create a tRNS chunk with 0 entries
         if (data_length) {
-          upng->alpha_palette = task_malloc(data_length);
+          upng->alpha_palette = UPNG_MALLOC(data_length);
           if (upng->alpha_palette == NULL) {
             SET_ERROR(upng, UPNG_ENOMEM);
             return upng->error;
@@ -647,7 +554,7 @@ upng_error upng_decode_metadata(upng_t *upng) {
         break;
       case CHUNK_FCTL:
         if (upng->apng_frame_control == NULL) {
-          upng->apng_frame_control = task_malloc(sizeof(apng_fctl));
+          upng->apng_frame_control = UPNG_MALLOC(sizeof(apng_fctl));
           if (upng->apng_frame_control == NULL) {
             SET_ERROR(upng, UPNG_ENOMEM);
             return upng->error;
@@ -730,7 +637,7 @@ upng_error upng_decode_image(upng_t *upng) {
 
   /* release old result, if any */
   if (upng->buffer) {
-    task_free(upng->buffer);
+    UPNG_FREE(upng->buffer);
     upng->buffer = NULL;
     upng->size = 0;
   }
@@ -753,7 +660,7 @@ upng_error upng_decode_image(upng_t *upng) {
     switch (chunk_type) {
       case CHUNK_FCTL:
         if (upng->apng_frame_control == NULL) {
-          upng->apng_frame_control = task_malloc(data_length);
+          upng->apng_frame_control = UPNG_MALLOC(data_length);
           if (upng->apng_frame_control == NULL) {
             SET_ERROR(upng, UPNG_ENOMEM);
             return upng->error;
@@ -822,7 +729,7 @@ upng_error upng_decode_image(upng_t *upng) {
   /* allocate space to store inflated (but still filtered) data */
   int32_t width_aligned_bytes = (width * upng_get_bpp(upng) + 7) / 8;
   inflated_size = (width_aligned_bytes * height) + height; // pad byte
-  inflated = (uint8_t *)task_malloc(inflated_size);
+  inflated = (uint8_t *)UPNG_MALLOC(inflated_size);
   if (inflated == NULL) {
     SET_ERROR(upng, UPNG_ENOMEM);
     return upng->error;
@@ -830,7 +737,7 @@ upng_error upng_decode_image(upng_t *upng) {
 
   /* decompress image data */
   if (uz_inflate(upng, inflated, inflated_size, compressed, compressed_size) != UPNG_EOK) {
-    task_free(inflated);
+    UPNG_FREE(inflated);
     return upng->error;
   }
 
@@ -840,7 +747,7 @@ upng_error upng_decode_image(upng_t *upng) {
   upng->size = inflated_size;
 
   if (upng->error != UPNG_EOK) {
-    task_free(upng->buffer);
+    UPNG_FREE(upng->buffer);
     upng->buffer = NULL;
     upng->size = 0;
   } else {
@@ -851,7 +758,7 @@ upng_error upng_decode_image(upng_t *upng) {
 }
 
 upng_t *upng_create(void) {
-  upng_t *upng = (upng_t *)task_malloc(sizeof(upng_t));
+  upng_t *upng = (upng_t *)UPNG_MALLOC(sizeof(upng_t));
   if (upng == NULL) {
     return NULL;
   }
@@ -881,23 +788,23 @@ void upng_destroy(upng_t *upng, bool free_image_buffer) {
 
   /* deallocate image buffer */
   if (free_image_buffer) {
-    task_free(upng->buffer);
+    UPNG_FREE(upng->buffer);
   }
 
   /* deallocate palette buffer */
-  task_free(upng->palette);
+  UPNG_FREE(upng->palette);
 
   /* deallocate alpha_palette buffer */
-  task_free(upng->alpha_palette);
+  UPNG_FREE(upng->alpha_palette);
 
   /* deallocate apng_frame_control struct */
-  task_free(upng->apng_frame_control);
+  UPNG_FREE(upng->apng_frame_control);
 
   /* deallocate source buffer */
   upng_free_source(upng);
 
   /* deallocate struct itself */
-  task_free(upng);
+  UPNG_FREE(upng);
 }
 
 upng_error upng_get_error(const upng_t *upng) {

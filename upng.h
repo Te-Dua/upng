@@ -33,6 +33,7 @@
    1.2  10 Mar 2014  Support non-byte-aligned images (fixes 1,2,4 bit PNG8 support)
    1.3  11 Feb 2015  Add PNG8 alpha_palette support.  Add APNG support (iterative frame decoding)
    1.4  14 Dec 2015  Replace built-in huffman inflate with tinflate (tiny inflate)
+   1.5   6 Oct 2026  Inflate through uzlib, configurable allocator (Core Devices)
  */
 
 #if !defined(UPNG_H)
@@ -41,25 +42,26 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#include "pbl/kernel/compiler.h"
-#include "pbl/util/misc.h"
+#define UPNG_FOURCC(a, b, c, d)                                                 \
+  ((uint32_t)(((uint32_t)(uint8_t)(a) << 24) | ((uint32_t)(uint8_t)(b) << 16) | \
+              ((uint32_t)(uint8_t)(c) << 8) | (uint32_t)(uint8_t)(d)))
 
 // PNG files start with [137, 'P', 'N', 'G']
-#define PNG_SIGNATURE PBL_FOURCC('\x89', 'P', 'N', 'G')
+#define PNG_SIGNATURE UPNG_FOURCC('\x89', 'P', 'N', 'G')
 
 #define PNG_HEADER_SIZE 33 // Full header == 8 + 25 (PNG_file_signature + IHDR_CHUNK)
 #define CHUNK_META_SIZE 12 // PNG Chunks have 12 bytes of metadata (Length, Type, CRC)
 #define FCTL_CHUNK_SIZE (26 + CHUNK_META_SIZE) // FCTL data_size + META_SIZE
 
-#define CHUNK_IHDR PBL_FOURCC('I', 'H', 'D', 'R') // Image Header Chunk
-#define CHUNK_IDAT PBL_FOURCC('I', 'D', 'A', 'T') // Image Data Chunk
-#define CHUNK_PLTE PBL_FOURCC('P', 'L', 'T', 'E') // Palette Chunk
-#define CHUNK_IEND PBL_FOURCC('I', 'E', 'N', 'D') // Image End Chunk
-#define CHUNK_TRNS PBL_FOURCC('t', 'R', 'N', 'S') // Alpha transparency for palettized images
-#define CHUNK_ACTL PBL_FOURCC('a', 'c', 'T', 'L') // Animation control (APNG)
-#define CHUNK_ADTL PBL_FOURCC('a', 'd', 'T', 'L') // Animation duration (APNG)
-#define CHUNK_FDAT PBL_FOURCC('f', 'd', 'A', 'T') // Frame Data (APNG)
-#define CHUNK_FCTL PBL_FOURCC('f', 'c', 'T', 'L') // Frame control (APNG)
+#define CHUNK_IHDR UPNG_FOURCC('I', 'H', 'D', 'R') // Image Header Chunk
+#define CHUNK_IDAT UPNG_FOURCC('I', 'D', 'A', 'T') // Image Data Chunk
+#define CHUNK_PLTE UPNG_FOURCC('P', 'L', 'T', 'E') // Palette Chunk
+#define CHUNK_IEND UPNG_FOURCC('I', 'E', 'N', 'D') // Image End Chunk
+#define CHUNK_TRNS UPNG_FOURCC('t', 'R', 'N', 'S') // Alpha transparency for palettized images
+#define CHUNK_ACTL UPNG_FOURCC('a', 'c', 'T', 'L') // Animation control (APNG)
+#define CHUNK_ADTL UPNG_FOURCC('a', 'd', 'T', 'L') // Animation duration (APNG)
+#define CHUNK_FDAT UPNG_FOURCC('f', 'd', 'A', 'T') // Frame Data (APNG)
+#define CHUNK_FCTL UPNG_FOURCC('f', 'c', 'T', 'L') // Frame control (APNG)
 
 #define APNG_DEFAULT_DELAY_UNITS (100) // APNG default delay units (ie. 1/100 per frame)
 
@@ -98,7 +100,7 @@ typedef enum upng_format {
 
 typedef struct upng_t upng_t;
 
-typedef struct PBL_PACKED rgb {
+typedef struct __attribute__((__packed__)) rgb {
   uint8_t r;
   uint8_t g;
   uint8_t b;
@@ -143,7 +145,7 @@ typedef enum apng_blend_ops {
   APNG_BLEND_OP_OVER
 } apng_blend_ops;
 
-typedef struct PBL_PACKED apng_fctl {
+typedef struct __attribute__((__packed__)) apng_fctl {
   uint32_t sequence_number;
   uint32_t width;
   uint32_t height;
