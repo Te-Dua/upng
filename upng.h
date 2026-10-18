@@ -111,6 +111,16 @@ void upng_destroy(upng_t *upng, bool free_image_buffer);
 
 void upng_load_bytes(upng_t *upng, const uint8_t *source_buffer, uint32_t source_size);
 
+/* Reads len bytes at offset from the start of the PNG file into buf; returns the bytes read. */
+typedef uint32_t (*upng_read_fn)(void *ctx, uint8_t *buf, uint32_t offset, uint32_t len);
+
+/* Decode a PNG whose compressed data stays in storage. head holds the first head_size bytes of
+ * the file and must reach past the IDAT chunk header; the IDAT payload is pulled through read.
+ * upng takes ownership of head and frees it before allocating the image. Animated PNGs are not
+ * supported this way. */
+void upng_load_stream(upng_t *upng, uint8_t *head, uint32_t head_size, uint32_t file_size,
+                      upng_read_fn read, void *read_ctx);
+
 upng_error upng_decode_metadata(upng_t *upng);
 upng_error upng_decode_image(upng_t *upng);
 

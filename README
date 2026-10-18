@@ -34,7 +34,9 @@ PebbleOS fork
 This is the uPNG used by PebbleOS. It differs from upstream in:
 
 - APNG support (iterative frame decoding) and PNG8 alpha palettes;
-- decoding from an in-memory buffer only, into the image's own format;
+- decoding into the image's own format, from an in-memory buffer or, with
+  upng_load_stream(), with the compressed data read from storage through a
+  callback so it is never resident beside the decoded image;
 - inflate through uzlib (https://github.com/pfalcon/uzlib), which must be
   on the include path and linked in;
 - allocation through UPNG_MALLOC() and UPNG_FREE(), malloc() and free()

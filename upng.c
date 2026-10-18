@@ -93,6 +93,10 @@ typedef struct upng_source {
   const uint8_t *buffer;
   uint32_t size;
   char owning;
+  /* Streaming: the buffer is only the head of the file, the rest is read on demand. */
+  upng_read_fn read;
+  void *read_ctx;
+  uint32_t file_size;
 } upng_source;
 
 struct upng_t {
@@ -126,6 +130,89 @@ struct upng_t {
   upng_state state;
   upng_source source;
 };
+
+/* When streaming, only the IDAT payload may extend past the head, and then only to the end of
+ * the file. */
+static bool prv_chunk_fits(const upng_t *upng, uint32_t chunk_type, uint32_t data_length,
+                           uint32_t remaining) {
+  if (data_length <= remaining - CHUNK_META_SIZE) {
+    return true;
+  }
+  if (upng->source.read == NULL || chunk_type != CHUNK_IDAT) {
+    return false;
+  }
+  const uint32_t data_offset = (uint32_t)(upng->source.size - remaining) + 8;
+  return data_offset <= upng->source.file_size &&
+         data_length <= upng->source.file_size - data_offset;
+}
+
+#define UPNG_STREAM_WINDOW 512
+
+typedef struct {
+  struct uzlib_uncomp d; /* first, so the read callback can find the rest */
+  upng_read_fn read;
+  void *read_ctx;
+  uint32_t offset;    /* next file offset to read */
+  uint32_t remaining; /* compressed bytes left */
+  uint8_t window[UPNG_STREAM_WINDOW];
+} upng_stream;
+
+static int prv_stream_refill(struct uzlib_uncomp *d) {
+  upng_stream *st = (upng_stream *)d;
+  if (st->remaining == 0) {
+    return -1;
+  }
+  uint32_t len = st->remaining < UPNG_STREAM_WINDOW ? st->remaining : UPNG_STREAM_WINDOW;
+  if (st->read(st->read_ctx, st->window, st->offset, len) != len) {
+    st->remaining = 0;
+    return -1;
+  }
+  st->offset += len;
+  st->remaining -= len;
+  d->source = st->window + 1;
+  d->source_limit = st->window + len;
+  return st->window[0];
+}
+
+static upng_error uz_inflate_stream(upng_t *upng, uint8_t *out, uint32_t outsize,
+                                    uint32_t offset, uint32_t insize) {
+  uint8_t hdr[2];
+  if (insize < 2 || upng->source.read(upng->source.read_ctx, hdr, offset, 2) != 2) {
+    SET_ERROR(upng, UPNG_EMALFORMED);
+    return upng->error;
+  }
+  /* the same zlib header checks as uz_inflate() */
+  if ((hdr[0] * 256 + hdr[1]) % 31 != 0 || (hdr[0] & 15) != 8 || ((hdr[0] >> 4) & 15) > 7 ||
+      ((hdr[1] >> 5) & 1) != 0) {
+    SET_ERROR(upng, UPNG_EMALFORMED);
+    return upng->error;
+  }
+
+  upng_stream *st = UPNG_MALLOC(sizeof(*st));
+  if (st == NULL) {
+    SET_ERROR(upng, UPNG_ENOMEM);
+    return upng->error;
+  }
+  uzlib_uncompress_init(&st->d, NULL, 0);
+  st->read = upng->source.read;
+  st->read_ctx = upng->source.read_ctx;
+  st->offset = offset + 2;
+  st->remaining = insize - 2;
+  st->d.source = NULL;
+  st->d.source_limit = NULL;
+  st->d.source_read_cb = prv_stream_refill;
+  st->d.dest_start = out;
+  st->d.dest = out;
+  st->d.dest_limit = out + outsize;
+
+  int res = uzlib_uncompress(&st->d);
+  if (res < 0 || st->d.dest != st->d.dest_limit) {
+    SET_ERROR(upng, UPNG_EMALFORMED);
+  }
+
+  UPNG_FREE(st);
+  return upng->error;
+}
 
 static upng_error uz_inflate(upng_t *upng, uint8_t *out, uint32_t outsize, const uint8_t *in,
                              uint32_t insize) {
@@ -585,7 +672,7 @@ upng_error upng_decode_metadata(upng_t *upng) {
     const uint8_t *data = upng_chunk_data(upng->cursor);
 
     /* make sure chunk header+payload is not larger than the total compressed */
-    if (data_length > remaining - CHUNK_META_SIZE) {
+    if (!prv_chunk_fits(upng, chunk_type, data_length, remaining)) {
       SET_ERROR(upng, UPNG_EMALFORMED);
       return upng->error;
     }
@@ -667,6 +754,7 @@ upng_error upng_decode_image(upng_t *upng) {
   uint32_t compressed_size = 0;
   uint32_t inflated_size = 0;
   bool cursor_at_next_frame = false;
+  uint32_t stream_offset = 0;
 
   /* if we have an error state, bail now */
   if (upng->error != UPNG_EOK) {
@@ -702,7 +790,7 @@ upng_error upng_decode_image(upng_t *upng) {
     const uint8_t *data = upng_chunk_data(upng->cursor);
 
     /* make sure chunk header+payload is not larger than the total compressed */
-    if (data_length > remaining - CHUNK_META_SIZE) {
+    if (!prv_chunk_fits(upng, chunk_type, data_length, remaining)) {
       SET_ERROR(upng, UPNG_EMALFORMED);
       return upng->error;
     }
@@ -729,6 +817,7 @@ upng_error upng_decode_image(upng_t *upng) {
         // TODO : fix for multiple consecutive IDAT chunks (PBL-14294)
         compressed = (uint8_t *)(data);
         compressed_size = data_length;
+        stream_offset = (uint32_t)(data - upng->source.buffer);
         cursor_at_next_frame = true; // stop processing chunks at the IDAT/fdAT chunks
         break;
       case CHUNK_IEND:
@@ -763,6 +852,18 @@ upng_error upng_decode_image(upng_t *upng) {
     return upng->error;
   }
 
+  /* A streamed file: only an IDAT may be decoded, and the head is no longer needed once the chunk
+   * walk is done, so release it before the largest allocation. */
+  const bool streaming = (upng->source.read != NULL);
+  if (streaming) {
+    if (upng->is_apng) {
+      SET_ERROR(upng, UPNG_EUNSUPPORTED);
+      return upng->error;
+    }
+    upng_free_source(upng);
+    upng->cursor = NULL;
+  }
+
   /* allocate space to store inflated (but still filtered) data */
   inflated_size = (width_aligned_bytes * height) + height; // pad byte
   inflated = (uint8_t *)UPNG_MALLOC(inflated_size);
@@ -772,7 +873,10 @@ upng_error upng_decode_image(upng_t *upng) {
   }
 
   /* decompress image data */
-  if (uz_inflate(upng, inflated, inflated_size, compressed, compressed_size) != UPNG_EOK) {
+  upng_error inflate_err =
+      streaming ? uz_inflate_stream(upng, inflated, inflated_size, stream_offset, compressed_size)
+                : uz_inflate(upng, inflated, inflated_size, compressed, compressed_size);
+  if (inflate_err != UPNG_EOK) {
     UPNG_FREE(inflated);
     return upng->error;
   }
@@ -815,6 +919,17 @@ void upng_load_bytes(upng_t *upng, const uint8_t *buffer, uint32_t size) {
   upng->source.buffer = buffer;
   upng->source.size = size;
   upng->source.owning = 0;
+}
+
+void upng_load_stream(upng_t *upng, uint8_t *head, uint32_t head_size, uint32_t file_size,
+                      upng_read_fn read, void *read_ctx) {
+  upng->cursor = head;
+  upng->source.buffer = head;
+  upng->source.size = head_size;
+  upng->source.owning = 1;
+  upng->source.read = read;
+  upng->source.read_ctx = read_ctx;
+  upng->source.file_size = file_size;
 }
 
 void upng_destroy(upng_t *upng, bool free_image_buffer) {
